@@ -20,6 +20,7 @@ export async function startWranglerDev(opts: {
 	port: number
 	vars?: Record<string, string>
 	fixtures?: Record<string, string>
+	persistTo?: string
 }): Promise<WranglerDevHandle> {
 	const base = `http://127.0.0.1:${opts.port}`
 	const distDir = join(appDir, 'dist')
@@ -41,7 +42,14 @@ export async function startWranglerDev(opts: {
 	])
 	const server: ChildProcess = spawn(
 		process.execPath,
-		[wranglerBin, 'dev', '--port', String(opts.port), ...varArgs],
+		[
+			wranglerBin,
+			'dev',
+			'--port',
+			String(opts.port),
+			...(opts.persistTo ? ['--persist-to', opts.persistTo] : []),
+			...varArgs,
+		],
 		{
 			cwd: appDir,
 			env: { ...process.env, WRANGLER_SEND_METRICS: 'false', CI: '1' },

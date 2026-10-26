@@ -16,12 +16,93 @@ It exposes:
 - `exec` — execute JavaScript against the live editor in the widget via a pending-request callback bridge
 - `_exec_callback` — app-only tool the widget calls to resolve a pending `exec` request
 - `save_checkpoint` / `read_checkpoint` — app-only tools used by the widget for checkpoint persistence
+- `search_boards` / `read_board` — read-only tools for named documents saved in the examples app's `/boards` page
+
+Named browser boards use a separate `NamedBoardStore` Durable Object. They remain available after the browser closes and do not expire with an MCP session.
 
 ### Widget
 
 The widget is a React app (`src/widget/mcp-app.tsx`) that renders a full tldraw canvas inside the MCP host's iframe.
 
 When the AI calls `exec`, the server creates a pending request and the widget picks it up, runs the code through a focused editor proxy (`src/widget/focused/`) that translates between an AI-friendly shape format (simple string IDs, flat `_type` shapes) and tldraw's internal `TLShape`/`TLShapeId` types, then calls `_exec_callback` to resolve the pending request with the result. Canvas state is checkpointed to the Durable Object's SQLite database and to the browser's local storage.
+
+## Named browser boards
+
+Open the examples app's `/boards` page to draw normally, save a document with a name, and later ask an agent to read it. The browser and MCP tools share the saved document through the MCP worker.
+
+### Run locally
+
+For a fresh checkout, install dependencies and build the SDK packages from the repository root:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build-package
+```
+
+Start the MCP app in one terminal:
+
+```bash
+pnpm --filter mcp-app dev
+```
+
+Start the examples app in another terminal:
+
+```bash
+pnpm --filter examples.tldraw.com dev
+```
+
+Open <http://localhost:5420/boards>, create a named board, and wait for **Saved**. Connect your MCP client to <http://127.0.0.1:8787/mcp> and ask:
+
+> Find my saved board named "Weekly planning" with search_boards, then use read_board to summarize it.
+
+Reconnect an existing MCP client after updating the server so it discovers the new tools. `search_boards` searches names and IDs; `read_board` returns saved records and extracted text. The tools work after the browser tab closes. For paginated reads, pass the returned `nextOffset` and `revision` so a change between requests is detected.
+
+The `/boards` page can import `.tldr` files and its own downloaded `.tldraw-board.json` copies. Each import creates a new board. Existing canvases in `/basic/full` and the MCP widget are separate documents; import or copy their contents into a named board when you want these tools to read them. Widget `exec` calls continue to operate on the widget's canvas.
+
+### LAN and Tailscale access
+
+Set `NAMED_BOARD_ALLOWED_ORIGINS` in `apps/mcp-app/.dev.vars` to the browser addresses you use. Replace these example addresses with your own:
+
+```dotenv
+NAMED_BOARD_ALLOWED_ORIGINS="http://192.168.1.50:5420,http://100.101.102.103:5420,https://board-host.example-tailnet.ts.net"
+```
+
+Each entry is an exact origin: scheme, hostname or IP, and port when it is not the default. Use literal URLs in this setting; dotenv variable interpolation such as `${BOARD_HOST}` is not supported by the examples server. Omit paths, query strings, trailing slashes, and wildcards. Use the browser-facing web port, normally `5420`. List the server addresses you open in a browser; connecting devices do not each need an entry. `localhost`, `127.0.0.1`, and `[::1]` remain available without this setting.
+
+The examples Vite server reads the same setting to allow the corresponding hostnames. For the default local worker, `.dev.vars` takes precedence; when it is absent, `.env` and `.env.local` are merged, with `.env.local` taking precedence. Keep your existing environment file and other settings. Vite uses only the origin list for server configuration and does not expose the worker's token to the browser bundle.
+
+Restart both the examples server and MCP worker after changing this setting. The web server must also listen on an address reachable from your LAN or tailnet; `pnpm --filter examples.tldraw.com dev` uses Vite's `--host` option. An existing service that already serves `/boards` over your network can keep its current listening address. Browser board requests are proxied to the MCP worker at `127.0.0.1:8787` on the same server.
+
+Board creation uses tldraw's ID generator and works on HTTP network origins where the browser does not expose `crypto.randomUUID()`.
+
+### Authentication
+
+If you already set `MCP_AUTH_TOKEN`, the same bearer token protects the named-board API. The browser prompts for it and keeps it only in memory for the open page. Keep the token configured in your MCP client as well. With no token configured, the worker does not require one. The deployment has one shared board catalog and does not add per-user accounts.
+
+### Storage and editing limits
+
+The agent reads the last successfully saved document. Wait for **Saved** before asking it to inspect your latest changes. These MCP tools read named boards; they do not edit them or return screenshots or OCR. Embedded media remains in the saved document, but its bytes are omitted from tool results. External asset URLs are not fetched by the tools.
+
+Each save request is limited to 10 MiB, including embedded image and video data. Two open tabs do not merge concurrent edits: an older tab's save is rejected when another tab has saved a newer revision. Use **Download unsaved copy** to preserve your draft before choosing **Reload saved version**.
+
+In local Wrangler development, the board data lives in `apps/mcp-app/.wrangler/state`, or the directory selected with `--persist-to`. Keep the worker's name, working directory, and persistence path stable when updating. To back up the database, stop the worker and copy its entire persistence directory. **Download copy** provides a portable backup of an individual board.
+
+### Update through Git
+
+Update the branch your deployment tracks from the repository root:
+
+```bash
+git pull --ff-only
+pnpm install --frozen-lockfile
+```
+
+Restart the existing web and MCP processes. For user services named `tldraw-web.service` and `tldraw-mcp.service`:
+
+```bash
+systemctl --user restart tldraw-mcp.service tldraw-web.service
+```
+
+If you have source edits from an earlier manual installation, review `git status` and `git diff` and preserve those edits before switching branches or pulling. Reconcile overlapping changes with the tracked implementation. Keep your local environment file and Wrangler persistence directory; source updates do not require resetting the board database.
 
 ## Developing
 

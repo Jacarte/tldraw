@@ -1,6 +1,7 @@
 import path from 'path'
 import react from '@vitejs/plugin-react'
 import { Plugin, PluginOption, defineConfig } from 'vite'
+import { getNamedBoardAllowedHosts } from './scripts/named-board-config'
 
 /**
  * Plugin to enable SPA fallback for vite preview.
@@ -87,7 +88,18 @@ export default defineConfig(({ mode }) => ({
 	},
 	server: {
 		port: 5420,
-		allowedHosts: true,
+		allowedHosts: [
+			'localhost',
+			'127.0.0.1',
+			...getNamedBoardAllowedHosts(path.join(__dirname, '../mcp-app')),
+		],
+		proxy: {
+			'/api/local-boards': {
+				target: 'http://127.0.0.1:8787',
+				changeOrigin: true,
+				rewrite: (url) => url.replace(/^\/api\/local-boards/, '/boards'),
+			},
+		},
 	},
 	preview: {
 		port: 5420,

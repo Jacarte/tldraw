@@ -50,6 +50,13 @@ const router = createBrowserRouter([
 		lazy: async () => ({ element: <Develop /> }),
 	},
 	{
+		path: 'boards',
+		lazy: async () => {
+			const { default: NamedBoards } = await import('./NamedBoards')
+			return { element: <NamedBoards /> }
+		},
+	},
+	{
 		path: 'end-to-end',
 		lazy: async () => ({ element: <EndToEnd /> }),
 	},

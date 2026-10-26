@@ -11,6 +11,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { McpAgent } from 'agents/mcp'
 import { CanvasStore } from './canvas-store'
 import { Logger } from './logger'
+import { handleNamedBoardRequest, NamedBoardStore, registerNamedBoardTools } from './named-boards'
 import { registerTools } from './register-tools'
 import { loadEditorApiSpecFromAssets, loadMethodMapFromAssets } from './shared/generated-data'
 import { PendingRequests } from './shared/pending-requests'
@@ -31,8 +32,11 @@ import { resolveMcpAppHostNameFromServerInfo } from './shared/utils'
 // --- Types ---
 
 export { CanvasStore }
+export { NamedBoardStore }
 
 interface Env {
+	NAMED_BOARD_STORE: DurableObjectNamespace<NamedBoardStore>
+	NAMED_BOARD_ALLOWED_ORIGINS?: string
 	MCP_OBJECT: DurableObjectNamespace<TldrawMCP>
 	CANVAS_STORE: DurableObjectNamespace<CanvasStore>
 	ASSETS: Fetcher
@@ -94,7 +98,7 @@ export class TldrawMCP extends McpAgent<Env> {
 			websiteUrl: MCP_SERVER_WEBSITE_URL,
 		},
 		{
-			instructions: MCP_SERVER_INSTRUCTIONS,
+			instructions: `${MCP_SERVER_INSTRUCTIONS}\n\nFor named boards saved in the local browser app, use search_boards to find the board ID, then read_board to inspect the saved document. These tools work without opening a canvas widget. Widget exec and checkpoint tools operate on separate chat canvases and do not edit these saved browser boards. If several boards match a name, clarify which board the user means.`,
 		}
 	)
 	// The Agents SDK defaults `observability` to an implementation whose `emit()`
@@ -132,6 +136,7 @@ export class TldrawMCP extends McpAgent<Env> {
 	}
 
 	async init() {
+		registerNamedBoardTools(this.server, this.env.NAMED_BOARD_STORE)
 		this.server.server.oninitialized = () => {
 			const clientInfo = this.server.server.getClientVersion()
 			const resolved = resolveMcpAppHostNameFromServerInfo(clientInfo?.name ?? '')
@@ -530,6 +535,10 @@ export default {
 					return corsResponse(new Response('Unauthorized', { status: 401 }))
 				}
 			}
+
+			// Saved browser boards share the MCP bearer-token check above.
+			const namedBoardResponse = await handleNamedBoardRequest(request, env)
+			if (namedBoardResponse) return namedBoardResponse
 
 			// SSE transport (legacy)
 			if (url.pathname === '/sse' || url.pathname.startsWith('/sse/')) {
