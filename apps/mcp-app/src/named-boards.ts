@@ -4,6 +4,12 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { DurableObject } from 'cloudflare:workers'
 import { z } from 'zod'
+import {
+	applyBoardEdits,
+	BoardEditError,
+	boardEditOperations,
+	type BoardEditOperation,
+} from './named-board-edits'
 
 /** Local, single-user documents. These outlive the MCP widget's expiring sessions. */
 export const MAX_BOARD_REQUEST_BYTES = 10 * 1024 * 1024
@@ -12,6 +18,20 @@ const MAX_READ_VIEW_BYTES = 64 * 1024
 const MAX_TOOL_RESULT_BYTES = 100 * 1024
 const BOARD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
 const encoder = new TextEncoder()
+const editBoardInput = z.strictObject({
+	boardId: z.string().regex(BOARD_ID),
+	expectedRevision: z.number().int().min(1),
+	title: z.string().trim().min(1).max(128).optional(),
+	operations: boardEditOperations,
+})
+const readRecordInput = z.strictObject({
+	boardId: z.string().regex(BOARD_ID),
+	recordId: z.string().min(1).max(512),
+	revision: z.number().int().min(1),
+	path: z.array(z.string().max(512)).max(64).optional(),
+	offset: z.number().int().min(0).max(MAX_BOARD_REQUEST_BYTES).optional(),
+	limit: z.number().int().min(1).max(4000).optional(),
+})
 
 export interface NamedBoardDocument {
 	schema: Record<string, unknown>
@@ -435,6 +455,128 @@ export class NamedBoardStore extends DurableObject<NamedBoardOriginEnv> {
 		})
 	}
 
+	private boardAtRevision(boardId: string, expectedRevision: number) {
+		if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+			fail(400, 'invalid_request', 'Use the positive revision returned by read_board.')
+		}
+		const board = this.loadBoard(boardId)
+		if (board.revision !== expectedRevision) {
+			throw new BoardRequestError(
+				409,
+				'revision_conflict',
+				'The board changed. Read it again before editing or continuing pagination.',
+				board
+			)
+		}
+		return board
+	}
+
+	editBoard(options: z.infer<typeof editBoardInput>) {
+		try {
+			const parsed = editBoardInput.safeParse(options)
+			if (!parsed.success) fail(400, 'invalid_request', parsed.error.message.slice(0, 2000))
+			if (byteLength(options) > MAX_BOARD_REQUEST_BYTES)
+				fail(413, 'document_too_large', 'The edit request exceeds the 10 MiB limit.')
+			if (!parsed.data.operations.length && parsed.data.title === undefined)
+				fail(400, 'invalid_edit', 'Supply operations or a new title.')
+			const board = this.boardAtRevision(options.boardId, options.expectedRevision)
+			const document = applyBoardEdits(board.document, parsed.data.operations)
+			const saved = this.saveBoard(board.id, {
+				title: parsed.data.title ?? board.title,
+				baseRevision: options.expectedRevision,
+				document,
+			})
+			return { ...saved, updated: true, operationCount: options.operations.length }
+		} catch (error) {
+			if (error instanceof BoardRequestError) return errorBody(error)
+			if (error instanceof BoardEditError) return { error: error.message, code: error.code }
+			throw error
+		}
+	}
+
+	setBoardShapeText(options: {
+		boardId: string
+		shapeId: string
+		expectedRevision: number
+		text: string
+	}) {
+		try {
+			if (typeof options.text !== 'string' || options.text.length > 10_000)
+				fail(400, 'invalid_request', 'text must be at most 10,000 characters.')
+			const board = this.boardAtRevision(options.boardId, options.expectedRevision)
+			const shape = Object.hasOwn(board.document.store, options.shapeId)
+				? board.document.store[options.shapeId]
+				: undefined
+			if (!shape || shape.typeName !== 'shape')
+				fail(404, 'shape_not_found', 'That shape does not exist on this saved board.')
+			if (!['geo', 'text', 'note', 'arrow', 'frame'].includes(String(shape.type)))
+				fail(
+					422,
+					'unsupported_shape',
+					'Text updates support geo, text, note, arrow and frame shapes.'
+				)
+			const paragraphs = options.text
+				.replace(/\r\n?/g, '\n')
+				.split('\n')
+				.map((line) =>
+					line
+						? { type: 'paragraph', content: [{ type: 'text', text: line }] }
+						: { type: 'paragraph' }
+				)
+			const operation: BoardEditOperation = {
+				op: 'update',
+				recordId: options.shapeId,
+				changes: {
+					props:
+						shape.type === 'frame'
+							? { name: options.text }
+							: { richText: { type: 'doc', content: paragraphs } },
+				},
+			}
+			const result = this.editBoard({
+				boardId: board.id,
+				expectedRevision: options.expectedRevision,
+				operations: [operation],
+			})
+			return 'error' in result ? result : { ...result, shapeId: options.shapeId }
+		} catch (error) {
+			if (error instanceof BoardRequestError) return errorBody(error)
+			throw error
+		}
+	}
+
+	readBoardRecord(options: z.infer<typeof readRecordInput>) {
+		try {
+			const parsed = readRecordInput.safeParse(options)
+			if (!parsed.success) fail(400, 'invalid_request', parsed.error.message.slice(0, 2000))
+			const board = this.boardAtRevision(options.boardId, options.revision)
+			if (!Object.hasOwn(board.document.store, options.recordId))
+				fail(404, 'record_not_found', 'Record not found on this board.')
+			let value: unknown = board.document.store[options.recordId]
+			for (const key of options.path ?? []) {
+				if (!value || typeof value !== 'object' || !Object.hasOwn(value, key))
+					fail(404, 'path_not_found', 'The requested property path does not exist.')
+				value = (value as Record<string, unknown>)[key]
+			}
+			const serialized = JSON.stringify(value)
+			const offset = options.offset ?? 0
+			const chunk = serialized.slice(offset, offset + (options.limit ?? 4000))
+			return {
+				boardId: board.id,
+				revision: board.revision,
+				recordId: options.recordId,
+				path: options.path ?? [],
+				offset,
+				totalLength: serialized.length,
+				json: chunk,
+				nextOffset: offset + chunk.length < serialized.length ? offset + chunk.length : null,
+			}
+		} catch (error) {
+			if (error instanceof BoardRequestError) return errorBody(error)
+			throw error
+		}
+	}
+
 	/** RPC response stays small; the full document is only returned by the browser REST endpoint. */
 	inspectBoard(options: ReadOptions) {
 		try {
@@ -504,6 +646,8 @@ function plainText(record: BoardRecord): string {
 	}
 	visit(props.richText)
 	if (!text.trim() && typeof props.text === 'string') text = props.text.slice(0, 4000)
+	if (!text.trim() && record.type === 'frame' && typeof props.name === 'string')
+		text = props.name.slice(0, 4000)
 	return text.trim().slice(0, 4000)
 }
 
@@ -655,7 +799,7 @@ function makeReadView(
 		records: [] as ReturnType<typeof previewRecord>[],
 		truncatedRecords: false,
 		notes:
-			'This is saved document data, not a screenshot. Embedded asset bytes are stored but omitted from tools; external asset URLs are references and are not fetched. Large record properties may be shortened. Use nextOffset and the same revision to continue; omit pageId to read all document records.',
+			'This is saved document data, not a screenshot. Embedded asset bytes are omitted from these previews; external URLs are not fetched. Large record properties may be shortened. Use read_board_record for exact record or property JSON. Use nextOffset and the same revision to continue; omit pageId to read all document records.',
 	}
 	for (const record of all.slice(offset, offset + limit)) {
 		const preview = previewRecord(record)
@@ -709,7 +853,7 @@ function toolResult(result: Record<string, unknown>): CallToolResult {
 	return response
 }
 
-/** Read-only tools are deliberately separate from the original interactive-widget tools. */
+/** Saved boards are separate documents from the interactive widget canvas. */
 export function registerNamedBoardTools(
 	server: McpServer,
 	namespace: DurableObjectNamespace<NamedBoardStore>
@@ -756,5 +900,55 @@ export function registerNamedBoardTools(
 			annotations,
 		},
 		async (options) => toolResult({ ...(await getStore(namespace).inspectBoard(options)) })
+	)
+
+	server.registerTool(
+		'read_board_record',
+		{
+			title: 'Read exact saved board record data',
+			description:
+				'Read exact JSON for one saved record or a property path (array of keys, for example ["props","richText"]). Use the revision from read_board. Unlike previews, this returns lossless JSON string chunks, including embedded media when requested. Concatenate json chunks using nextOffset and the SAME revision, then JSON.parse once at the end. Never write truncated read_board previews back as complete records.',
+			inputSchema: readRecordInput,
+			annotations,
+		},
+		async (options) => toolResult({ ...(await getStore(namespace).readBoardRecord(options)) })
+	)
+	server.registerTool(
+		'edit_board',
+		{
+			title: 'Edit a saved board',
+			description:
+				'Atomically edit saved tldraw document records without a browser. Use boardId and expectedRevision from read_board. Supports all built-in shapes and their properties: position, dimensions, rotation, styles, rich text, crop, paths, links, locks, opacity and layer index; groups/frames via parentId; pages, arrow bindings, assets, document settings and user records. operations (max 500): create requires a complete new record; update uses recordId and changes (props/meta merge one level, nested values/arrays replace); replace requires a complete record and can remove optional fields; delete requires recordId. IDs and record types are immutable. Optional title renames the board. Use read_board_record for exact data before replace/copy. Supply all related edits together: deletes do not cascade, bindings must stay on one page, children need existing parents and assets must remain referenced correctly. Coordinates are relative to the parent; grouping/reparenting requires adjusting them. This is record editing, not the live Editor API: layout, text measurement and binding geometry are not recalculated. All edits validate and save once or none save; on revision_conflict re-read first. Unsupported custom/old schemas require the matching browser app. No external URLs are fetched.',
+			inputSchema: editBoardInput,
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: true,
+				idempotentHint: false,
+				openWorldHint: false,
+			},
+		},
+		async (options) => toolResult({ ...(await getStore(namespace).editBoard(options)) })
+	)
+
+	server.registerTool(
+		'set_board_shape_text',
+		{
+			title: 'Set text on a saved board shape',
+			description:
+				'Persistently replace a geo, text, note or arrow label, or a frame name, without an open browser. Replaces rich text formatting with plain text. Use shapeId and expectedRevision from read_board. On revision_conflict, re-read first. Use edit_board for rich text or other edits; widget exec operates on a separate canvas.',
+			inputSchema: z.object({
+				boardId: z.string().regex(BOARD_ID),
+				shapeId: z.string().startsWith('shape:').max(512),
+				expectedRevision: z.number().int().min(1),
+				text: z.string().max(10_000),
+			}),
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: true,
+				idempotentHint: false,
+				openWorldHint: false,
+			},
+		},
+		async (options) => toolResult({ ...(await getStore(namespace).setBoardShapeText(options)) })
 	)
 }
