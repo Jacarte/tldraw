@@ -98,7 +98,7 @@ export class TldrawMCP extends McpAgent<Env> {
 			websiteUrl: MCP_SERVER_WEBSITE_URL,
 		},
 		{
-			instructions: `${MCP_SERVER_INSTRUCTIONS}\n\nFor named boards saved in the local browser app, use search_boards to find the board ID, then read_board to inspect the saved document. These tools work without opening a canvas widget. Widget exec and checkpoint tools operate on separate chat canvases and do not edit these saved browser boards. If several boards match a name, clarify which board the user means.`,
+			instructions: `${MCP_SERVER_INSTRUCTIONS}\n\nFor named boards saved in the local browser app, use search_boards to find the board ID, then read_board to inspect the saved document. These tools work without opening a canvas widget. For persistent text edits to existing rectangles, text or notes, call set_board_shape_text using a shape ID and expectedRevision from read_board. It edits the saved document even when no browser is open. Widget exec and checkpoint tools operate on separate chat canvases, not saved boards. If several boards match a name, clarify which board the user means.`,
 		}
 	)
 	// The Agents SDK defaults `observability` to an implementation whose `emit()`

@@ -435,6 +435,75 @@ export class NamedBoardStore extends DurableObject<NamedBoardOriginEnv> {
 		})
 	}
 
+
+	/** Update a saved document directly, without an open browser or MCP widget. */
+	setBoardShapeText(options: {
+		boardId: string
+		shapeId: string
+		expectedRevision: number
+		text: string
+	}) {
+		try {
+			validateId(options.boardId)
+			if (!Number.isSafeInteger(options.expectedRevision) || options.expectedRevision < 1) {
+				fail(400, 'invalid_request', 'expectedRevision must be the revision returned by read_board.')
+			}
+			if (
+				typeof options.shapeId !== 'string' ||
+				!options.shapeId.startsWith('shape:') ||
+				options.shapeId.length > 512
+			) {
+				fail(400, 'invalid_request', 'shapeId must be an existing tldraw shape ID.')
+			}
+			if (typeof options.text !== 'string' || options.text.length > 10_000) {
+				fail(400, 'invalid_request', 'text must be a string of at most 10,000 characters.')
+			}
+
+			const board = this.loadBoard(options.boardId)
+			if (board.revision !== options.expectedRevision) {
+				throw new BoardRequestError(
+					409,
+					'revision_conflict',
+					'The board has newer changes. Read it again and use its current revision.',
+					board
+				)
+			}
+			const shape = board.document.store[options.shapeId]
+			if (!shape || shape.typeName !== 'shape') {
+				fail(404, 'shape_not_found', 'That shape does not exist on this saved board.')
+			}
+			if (!['geo', 'text', 'note'].includes(String(shape.type)) || !isRecord(shape.props)) {
+				fail(
+					422,
+					'unsupported_shape',
+					'Only geo (including rectangle), text, and note shapes support this text update.'
+				)
+			}
+			const paragraphs = options.text.replace(/\r\n/g, '\n').split('\n').map((line) =>
+				line ? { type: 'paragraph', content: [{ type: 'text', text: line }] } : { type: 'paragraph' }
+			)
+			const updatedDocument: NamedBoardDocument = {
+				...board.document,
+				store: {
+					...board.document.store,
+					[options.shapeId]: {
+						...shape,
+						props: { ...shape.props, richText: { type: 'doc', content: paragraphs } },
+					},
+				},
+			}
+			const saved = this.saveBoard(options.boardId, {
+				title: board.title,
+				baseRevision: options.expectedRevision,
+				document: updatedDocument,
+			})
+			return { ...saved, shapeId: options.shapeId, updated: true }
+		} catch (error) {
+			if (error instanceof BoardRequestError) return errorBody(error)
+			throw error
+		}
+	}
+
 	/** RPC response stays small; the full document is only returned by the browser REST endpoint. */
 	inspectBoard(options: ReadOptions) {
 		try {
@@ -756,5 +825,27 @@ export function registerNamedBoardTools(
 			annotations,
 		},
 		async (options) => toolResult({ ...(await getStore(namespace).inspectBoard(options)) })
+	)
+
+	server.registerTool(
+		'set_board_shape_text',
+		{
+			title: 'Set text on a saved board shape',
+			description:
+				'Persistently replace text in a geo (including rectangle), text or note shape on a saved browser board WITHOUT an open widget or browser. First call search_boards and read_board to get the board ID, exact shape ID and revision. Pass expectedRevision from read_board to avoid overwriting concurrent changes. For revision_conflict, re-read first. The widget exec tool never edits saved boards.',
+			inputSchema: z.object({
+				boardId: z.string().regex(BOARD_ID),
+				shapeId: z.string().startsWith('shape:').max(512),
+				expectedRevision: z.number().int().min(1),
+				text: z.string().max(10_000),
+			}),
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: false,
+				openWorldHint: false,
+			},
+		},
+		async (options) => toolResult({ ...(await getStore(namespace).setBoardShapeText(options)) })
 	)
 }
