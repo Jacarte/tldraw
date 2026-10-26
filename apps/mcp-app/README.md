@@ -16,7 +16,8 @@ It exposes:
 - `exec` — execute JavaScript against the live editor in the widget via a pending-request callback bridge
 - `_exec_callback` — app-only tool the widget calls to resolve a pending `exec` request
 - `save_checkpoint` / `read_checkpoint` — app-only tools used by the widget for checkpoint persistence
-- `search_boards` / `read_board` — read-only tools for named documents saved in the examples app's `/boards` page
+- `search_boards` / `read_board` — search and inspect named browser boards
+- `set_board_shape_text` — persistently replace text on existing rectangles, text shapes or notes in saved boards without a live browser
 
 Named browser boards use a separate `NamedBoardStore` Durable Object. They remain available after the browser closes and do not expire with an MCP session.
 
@@ -55,7 +56,7 @@ Open <http://localhost:5420/boards>, create a named board, and wait for **Saved*
 
 > Find my saved board named "Weekly planning" with search_boards, then use read_board to summarize it.
 
-Reconnect an existing MCP client after updating the server so it discovers the new tools. `search_boards` searches names and IDs; `read_board` returns saved records and extracted text. The tools work after the browser tab closes. For paginated reads, pass the returned `nextOffset` and `revision` so a change between requests is detected.
+Reconnect an existing MCP client after updating the server so it discovers the new tools. `search_boards` searches names and IDs, and `read_board` returns saved records and extracted text. To edit an existing rectangle, text shape or note, call `read_board` to find its exact `shapeId` and current `revision`, then call `set_board_shape_text` with `boardId`, `shapeId`, `expectedRevision` and `text`. This updates the saved document even when no browser tab or MCP widget is open. The operation replaces rich text with plain text. If a stale revision is rejected, read the board again before trying another edit. If the board is open in the browser, reload it to see the new text; unsaved browser edits cannot be silently merged. For paginated reads, pass the returned `nextOffset` and `revision` so a change between requests is detected.
 
 The `/boards` page can import `.tldr` files and its own downloaded `.tldraw-board.json` copies. Each import creates a new board. Existing canvases in `/basic/full` and the MCP widget are separate documents; import or copy their contents into a named board when you want these tools to read them. Widget `exec` calls continue to operate on the widget's canvas.
 
@@ -81,7 +82,7 @@ If you already set `MCP_AUTH_TOKEN`, the same bearer token protects the named-bo
 
 ### Storage and editing limits
 
-The agent reads the last successfully saved document. Wait for **Saved** before asking it to inspect your latest changes. These MCP tools read named boards; they do not edit them or return screenshots or OCR. Embedded media remains in the saved document, but its bytes are omitted from tool results. External asset URLs are not fetched by the tools.
+The agent reads the last successfully saved document. Wait for **Saved** before asking it to inspect your latest changes. `search_boards` and `read_board` inspect named boards; `set_board_shape_text` also updates existing geo, text and note shape labels. These tools do not create or move shapes, take screenshots, or perform OCR. Embedded media remains in the saved document, but its bytes are omitted from tool results. External asset URLs are not fetched by the tools.
 
 Each save request is limited to 10 MiB, including embedded image and video data. Two open tabs do not merge concurrent edits: an older tab's save is rejected when another tab has saved a newer revision. Use **Download unsaved copy** to preserve your draft before choosing **Reload saved version**.
 

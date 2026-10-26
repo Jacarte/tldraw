@@ -300,6 +300,89 @@ describe('named boards through the real worker', () => {
 		})
 	})
 
+
+	test('writes text into an existing saved rectangle through MCP without a live canvas', async () => {
+		const id = randomUUID()
+		const shapeId = 'shape:rectangle'
+		const rectangle = {
+			id: shapeId,
+			typeName: 'shape',
+			type: 'geo',
+			parentId: 'page:first',
+			x: 50,
+			y: 100,
+			props: {
+				geo: 'rectangle',
+				w: 250,
+				h: 120,
+				richText: { type: 'doc', content: [] },
+			},
+		}
+		const created = await json<NamedBoardMetadata>(
+			await save({ id, title: 'Test4', snapshot: document({ [shapeId]: rectangle }) })
+		)
+		const sessionId = await session()
+		const firstRead = await tool<BoardView>(sessionId, 'read_board', { boardId: id })
+		expect(firstRead.data.revision).toBe(created.revision)
+		const toolList = await rpc<ListToolsResult>(sessionId, 'tools/list')
+		expect(toolList.tools.find((entry) => entry.name === 'set_board_shape_text')?.annotations).toMatchObject({
+			readOnlyHint: false,
+			destructiveHint: false,
+		})
+
+		const updated = await tool<NamedBoardMetadata & { shapeId: string; updated: boolean }>(
+			sessionId,
+			'set_board_shape_text',
+			{ boardId: id, shapeId, expectedRevision: firstRead.data.revision, text: 'Hello from pi!' }
+		)
+		expect(updated.result.isError).not.toBe(true)
+		expect(updated.data).toMatchObject({
+			id,
+			title: 'Test4',
+			shapeId,
+			revision: created.revision + 1,
+			updated: true,
+		})
+		const stored = await json<Board>(await request('/boards/' + id))
+		expect(stored.document.store[shapeId]).toEqual({
+			...rectangle,
+			props: {
+				...rectangle.props,
+				richText: {
+					type: 'doc',
+					content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Hello from pi!' }] }],
+				},
+			},
+		})
+		const laterRead = await tool<BoardView>(sessionId, 'read_board', { boardId: id })
+		expect(laterRead.data.records.find((entry) => entry.record.id === shapeId)?.text).toBe(
+			'Hello from pi!'
+		)
+
+		const stale = await tool<BoardError>(sessionId, 'set_board_shape_text', {
+			boardId: id,
+			shapeId,
+			expectedRevision: created.revision,
+			text: 'This must not overwrite newer edits',
+		})
+		expect(stale.result.isError).toBe(true)
+		expect(stale.data).toMatchObject({
+			code: 'revision_conflict',
+			current: { revision: created.revision + 1 },
+		})
+		const missing = await tool<BoardError>(sessionId, 'set_board_shape_text', {
+			boardId: id,
+			shapeId: 'shape:missing',
+			expectedRevision: created.revision + 1,
+			text: 'No shape',
+		})
+		expect(missing.result.isError).toBe(true)
+		expect(missing.data.code).toBe('shape_not_found')
+		const final = await json<Board>(await request('/boards/' + id))
+		expect(final.revision).toBe(2)
+		expect(final.document.store[shapeId]).toEqual(stored.document.store[shapeId])
+	}, 30_000)
+
 	test('admits only one simultaneous create for the same ID', async () => {
 		const id = randomUUID()
 		const responses = await Promise.all([
