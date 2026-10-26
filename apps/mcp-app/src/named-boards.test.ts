@@ -4,6 +4,8 @@ import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CallToolResult, ListToolsResult } from '@modelcontextprotocol/sdk/types.js'
+import { createTLSchema, DocumentRecordType, PageRecordType, TLDOCUMENT_ID } from '@tldraw/tlschema'
+import type { TLPage } from '@tldraw/tlschema'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import type { NamedBoardDocument, NamedBoardMetadata } from './named-boards'
 import {
@@ -47,14 +49,18 @@ interface BoardError {
 
 function document(extra: NamedBoardDocument['store'] = {}): NamedBoardDocument {
 	return {
-		schema: { schemaVersion: 2, sequences: {} },
+		schema: { ...createTLSchema().serialize() },
 		store: {
 			'document:document': {
-				id: 'document:document',
-				typeName: 'document',
-				name: 'Workspace',
+				...DocumentRecordType.create({ id: TLDOCUMENT_ID, name: 'Workspace' }),
 			},
-			'page:first': { id: 'page:first', typeName: 'page', name: 'Overview' },
+			'page:first': {
+				...PageRecordType.create({
+					id: PageRecordType.createId('first'),
+					name: 'Overview',
+					index: 'a1' as TLPage['index'],
+				}),
+			},
 			...extra,
 		},
 	}
@@ -300,7 +306,6 @@ describe('named boards through the real worker', () => {
 		})
 	})
 
-
 	test('writes text into an existing saved rectangle through MCP without a live canvas', async () => {
 		const id = randomUUID()
 		const shapeId = 'shape:rectangle'
@@ -311,10 +316,28 @@ describe('named boards through the real worker', () => {
 			parentId: 'page:first',
 			x: 50,
 			y: 100,
+			rotation: 0,
+			index: 'a1',
+			isLocked: false,
+			opacity: 1,
+			meta: {},
 			props: {
 				geo: 'rectangle',
 				w: 250,
 				h: 120,
+				dash: 'draw',
+				growY: 0,
+				url: '',
+				scale: 1,
+				flipX: false,
+				flipY: false,
+				color: 'black',
+				labelColor: 'black',
+				fill: 'none',
+				size: 'm',
+				font: 'draw',
+				align: 'middle',
+				verticalAlign: 'middle',
 				richText: { type: 'doc', content: [] },
 			},
 		}
@@ -325,9 +348,11 @@ describe('named boards through the real worker', () => {
 		const firstRead = await tool<BoardView>(sessionId, 'read_board', { boardId: id })
 		expect(firstRead.data.revision).toBe(created.revision)
 		const toolList = await rpc<ListToolsResult>(sessionId, 'tools/list')
-		expect(toolList.tools.find((entry) => entry.name === 'set_board_shape_text')?.annotations).toMatchObject({
+		expect(
+			toolList.tools.find((entry) => entry.name === 'set_board_shape_text')?.annotations
+		).toMatchObject({
 			readOnlyHint: false,
-			destructiveHint: false,
+			destructiveHint: true,
 		})
 
 		const updated = await tool<NamedBoardMetadata & { shapeId: string; updated: boolean }>(
@@ -382,6 +407,115 @@ describe('named boards through the real worker', () => {
 		expect(final.revision).toBe(2)
 		expect(final.document.store[shapeId]).toEqual(stored.document.store[shapeId])
 	}, 30_000)
+
+	test('edits records atomically through MCP, preserves exact data and rejects stale writers', async () => {
+		const id = randomUUID()
+		await json(await save({ id }))
+		const sessionId = await session()
+		const tools = await rpc<ListToolsResult>(sessionId, 'tools/list')
+		expect(tools.tools.find((t) => t.name === 'edit_board')?.annotations).toMatchObject({
+			readOnlyHint: false,
+			destructiveHint: true,
+		})
+		expect(tools.tools.find((t) => t.name === 'read_board_record')?.annotations).toMatchObject({
+			readOnlyHint: true,
+		})
+		const frame = {
+			id: 'shape:frame',
+			typeName: 'shape',
+			type: 'frame',
+			parentId: 'page:first',
+			x: 10,
+			y: 20,
+			rotation: 0,
+			index: 'a1',
+			isLocked: false,
+			opacity: 1,
+			meta: { long: 'Exact 😀\n'.repeat(2000) },
+			props: { w: 200, h: 100, color: 'black', name: 'Original' },
+		}
+		const created = await tool<NamedBoardMetadata>(sessionId, 'edit_board', {
+			boardId: id,
+			expectedRevision: 1,
+			title: 'Renamed',
+			operations: [{ op: 'create', record: frame }],
+		})
+		expect(created.result.isError).not.toBe(true)
+		expect(created.data).toMatchObject({ revision: 2, title: 'Renamed', recordCount: 3 })
+		let serialized = ''
+		let offset: number | null = 0
+		do {
+			const read: { result: CallToolResult; data: { json: string; nextOffset: number | null } } =
+				await tool(sessionId, 'read_board_record', {
+					boardId: id,
+					recordId: frame.id,
+					revision: 2,
+					path: ['meta', 'long'],
+					offset,
+					limit: 4000,
+				})
+			assertBoundedResult(read.result)
+			serialized += read.data.json
+			offset = read.data.nextOffset
+		} while (offset !== null)
+		expect(JSON.parse(serialized)).toBe(frame.meta.long)
+
+		const rejected = await tool<BoardError>(sessionId, 'edit_board', {
+			boardId: id,
+			expectedRevision: 2,
+			title: 'Must not save',
+			operations: [
+				{ op: 'update', recordId: frame.id, changes: { x: 100 } },
+				{ op: 'update', recordId: frame.id, changes: { opacity: 5 } },
+			],
+		})
+		expect(rejected.result.isError).toBe(true)
+		expect(rejected.data.code).toBe('invalid_record')
+		const unchanged = await json<Board>(await request('/boards/' + id))
+		expect(unchanged).toMatchObject({ revision: 2, title: 'Renamed' })
+		expect(unchanged.document.store[frame.id]).toEqual(frame)
+
+		const responses = await Promise.all(
+			[100, 200].map((x) =>
+				tool<NamedBoardMetadata & BoardError>(sessionId, 'edit_board', {
+					boardId: id,
+					expectedRevision: 2,
+					operations: [
+						{ op: 'update', recordId: frame.id, changes: { x, props: { color: 'red' } } },
+					],
+				})
+			)
+		)
+		expect(responses.filter((r) => !r.result.isError)).toHaveLength(1)
+		expect(responses.find((r) => r.result.isError)?.data.code).toBe('revision_conflict')
+		const staleRead = await tool<BoardError>(sessionId, 'read_board_record', {
+			boardId: id,
+			recordId: frame.id,
+			revision: 2,
+		})
+		expect(staleRead.data.code).toBe('revision_conflict')
+		await json(await save({ id, baseRevision: 2 }), 409)
+		const renamed = await tool<NamedBoardMetadata>(sessionId, 'set_board_shape_text', {
+			boardId: id,
+			shapeId: frame.id,
+			expectedRevision: 3,
+			text: 'Frame name',
+		})
+		expect(renamed.data.revision).toBe(4)
+		const read = await tool<BoardView>(sessionId, 'read_board', { boardId: id })
+		expect(read.data.records.find((r) => r.record.id === frame.id)?.text).toBe('Frame name')
+		const deleted = await tool<NamedBoardMetadata>(sessionId, 'edit_board', {
+			boardId: id,
+			expectedRevision: 4,
+			operations: [{ op: 'delete', recordId: frame.id }],
+		})
+		expect(deleted.data.revision).toBe(5)
+		await stop()
+		await start()
+		const persisted = await json<Board>(await request('/boards/' + id))
+		expect(persisted).toMatchObject({ revision: 5, title: 'Renamed', recordCount: 2 })
+		expect(persisted.document.store[frame.id]).toBeUndefined()
+	}, 90_000)
 
 	test('admits only one simultaneous create for the same ID', async () => {
 		const id = randomUUID()

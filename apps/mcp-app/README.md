@@ -17,7 +17,9 @@ It exposes:
 - `_exec_callback` — app-only tool the widget calls to resolve a pending `exec` request
 - `save_checkpoint` / `read_checkpoint` — app-only tools used by the widget for checkpoint persistence
 - `search_boards` / `read_board` — search and inspect named browser boards
-- `set_board_shape_text` — persistently replace text on existing rectangles, text shapes or notes in saved boards without a live browser
+- `read_board_record` — read exact record/property JSON in bounded chunks, including data shortened in previews
+- `edit_board` — atomically create, update, replace or delete saved document records and rename boards
+- `set_board_shape_text` — replace geo, text, note and arrow labels or frame names without a live browser
 
 Named browser boards use a separate `NamedBoardStore` Durable Object. They remain available after the browser closes and do not expire with an MCP session.
 
@@ -56,7 +58,32 @@ Open <http://localhost:5420/boards>, create a named board, and wait for **Saved*
 
 > Find my saved board named "Weekly planning" with search_boards, then use read_board to summarize it.
 
-Reconnect an existing MCP client after updating the server so it discovers the new tools. `search_boards` searches names and IDs, and `read_board` returns saved records and extracted text. To edit an existing rectangle, text shape or note, call `read_board` to find its exact `shapeId` and current `revision`, then call `set_board_shape_text` with `boardId`, `shapeId`, `expectedRevision` and `text`. This updates the saved document even when no browser tab or MCP widget is open. The operation replaces rich text with plain text. If a stale revision is rejected, read the board again before trying another edit. If the board is open in the browser, reload it to see the new text; unsaved browser edits cannot be silently merged. For paginated reads, pass the returned `nextOffset` and `revision` so a change between requests is detected.
+Reconnect an existing MCP client after updating the server so it discovers the new tools. Use `search_boards` to find the board, then `read_board` to get record IDs and the current revision. Pass that revision as `expectedRevision` to every edit. An edit either saves the entire batch with one new revision or leaves the board unchanged. On `revision_conflict`, read again before deciding how to retry.
+
+`edit_board` supports every built-in shape type, pages, bindings, assets, document settings and user records. You can change position, size, rotation, styles, rich text, paths, crop, links, opacity, locking and layer order. Creating or replacing a record requires a complete valid record; updating only requires the changed fields. `props` and `meta` merge one level, while nested objects and arrays replace their previous values. Use `replace` to remove optional fields. IDs, record types and shape/asset/binding subtypes cannot change in place.
+
+For example, move and restyle an existing rectangle and rename its board:
+
+```json
+{
+  "boardId": "weekly-planning",
+  "expectedRevision": 3,
+  "title": "Weekly planning — updated",
+  "operations": [
+    {
+      "op": "update",
+      "recordId": "shape:rectangle",
+      "changes": { "x": 200, "y": 100, "props": { "w": 300, "color": "blue" } }
+    }
+  ]
+}
+```
+
+Group/ungroup or move shapes between pages by creating/deleting group or page records and updating `parentId` in the same batch. Coordinates are relative to the parent, so include the transformed coordinates. Use `index` for layer/page ordering. Duplicate shapes by creating copies with fresh IDs; remap descendant parents and binding endpoints as needed. Add or retarget connectors through binding records, and insert or replace media through asset records and shape `assetId` properties. Deletes do not cascade: explicitly remove or reparent descendants and remove or retarget bindings/references in the same batch. The final graph must have a document, at least one page, no parent cycles, existing parents and assets, and valid binding endpoints on a single page.
+
+`read_board` returns bounded previews. Never use a truncated preview as a replacement record. For exact data, call `read_board_record` with the same `revision`, a `recordId`, and optionally a property `path`, such as `["props", "richText"]`. Concatenate the returned `json` strings using `nextOffset` and the same revision, then parse the complete JSON. This also permits lossless copies of paths, rich text and embedded assets. Partial updates preserve all fields you omit, including embedded media.
+
+`set_board_shape_text` is a shortcut for plain-text labels on geo, text, note and arrow shapes, or frame names. It replaces rich-text formatting; use `edit_board` with `props.richText` to preserve or apply formatting. If the board is open in a browser, reload it to see saved edits. Unsaved browser changes cannot be silently merged. For paginated `read_board` calls, pass `nextOffset` and `revision` to detect intervening changes.
 
 The `/boards` page can import `.tldr` files and its own downloaded `.tldraw-board.json` copies. Each import creates a new board. Existing canvases in `/basic/full` and the MCP widget are separate documents; import or copy their contents into a named board when you want these tools to read them. Widget `exec` calls continue to operate on the widget's canvas.
 
@@ -82,9 +109,11 @@ If you already set `MCP_AUTH_TOKEN`, the same bearer token protects the named-bo
 
 ### Storage and editing limits
 
-The agent reads the last successfully saved document. Wait for **Saved** before asking it to inspect your latest changes. `search_boards` and `read_board` inspect named boards; `set_board_shape_text` also updates existing geo, text and note shape labels. These tools do not create or move shapes, take screenshots, or perform OCR. Embedded media remains in the saved document, but its bytes are omitted from tool results. External asset URLs are not fetched by the tools.
+The agent reads the last successfully saved document. Wait for **Saved** before asking it to inspect your latest changes. These tools edit persisted records; they do not run Editor interaction hooks, measure text, calculate layout/binding geometry, fetch external URLs, take screenshots or perform OCR. Include any related geometry changes in the batch. Live Editor operations, selection, camera and undo/redo remain available through widget `exec` on its separate canvas.
 
-Each save request is limited to 10 MiB, including embedded image and video data. Two open tabs do not merge concurrent edits: an older tab's save is rejected when another tab has saved a newer revision. Use **Download unsaved copy** to preserve your draft before choosing **Reload saved version**.
+Edits use the worker's built-in tldraw schema. Invalid records, session records, unsupported custom/newer/older schemas, and broken references are rejected without saving. For an older board, first open and save it in the matching browser app. This prevents schema reinterpretation or silent loss of custom data.
+
+Each save/edit request and resulting document is limited to 10 MiB, including embedded image/video data; each edit batch allows up to 500 operations. Exact reads return up to 4,000 UTF-16 code units per JSON chunk. Two open tabs do not merge concurrent edits: an older tab's save is rejected when another tab or MCP edit has saved a newer revision. Use **Download unsaved copy** to preserve your draft before choosing **Reload saved version**.
 
 In local Wrangler development, the board data lives in `apps/mcp-app/.wrangler/state`, or the directory selected with `--persist-to`. Keep the worker's name, working directory, and persistence path stable when updating. To back up the database, stop the worker and copy its entire persistence directory. **Download copy** provides a portable backup of an individual board.
 
